@@ -16,6 +16,39 @@ use smithay::wayland::shell::xdg::{XdgShellHandler, XdgShellState};
 use smithay::wayland::shell::xdg::decoration::{XdgDecorationState, XdgDecorationHandler};
 use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as DecorationMode;
 use crate::layout::Layout;
+
+/// Resolve the decoration mode a rootless toplevel should end up with.
+///
+/// Rootless windows are backed by a real macOS window that can host a native
+/// title bar, so server-side decorations are offered whenever the client either
+/// asks for them or expresses no preference (via `new_decoration`). A client that
+/// explicitly asks for client-side decorations must be believed: Chromium and
+/// Electron accept a server-side configure but keep drawing their own window
+/// buttons, which would double the decoration against the native title bar.
+pub(crate) fn resolve_decoration_mode(
+    rootless: bool,
+    requested: Option<DecorationMode>,
+) -> Option<DecorationMode> {
+    match requested {
+        Some(DecorationMode::ClientSide) => Some(DecorationMode::ClientSide),
+        Some(DecorationMode::ServerSide) => Some(DecorationMode::ServerSide),
+        // No explicit request: advertise server-side decorations in rootless mode,
+        // where a native title bar is available, and stay unset otherwise.
+        None if rootless => Some(DecorationMode::ServerSide),
+        None => None,
+        // `Mode` is non-exhaustive; honour the client's preference verbatim.
+        Some(other) => Some(other),
+    }
+}
+
+/// Whether the macOS window should hide its native title bar because the client
+/// draws its own chrome. Server-side decoration mode means macOS owns the title
+/// bar; anything else (no negotiation, or an explicit client-side request) means
+/// the client owns it.
+pub(crate) fn client_draws_own_decorations(mode: Option<DecorationMode>) -> bool {
+    mode != Some(DecorationMode::ServerSide)
+}
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -1338,30 +1371,28 @@ use smithay::delegate_xdg_decoration;
 use smithay::wayland::shell::xdg::ToplevelSurface;
 impl XdgDecorationHandler for AppState {
     fn new_decoration(&mut self, toplevel: ToplevelSurface) {
+        let mode = resolve_decoration_mode(self.presentation.is_rootless(), None);
         toplevel.with_pending_state(|state| {
-            state.decoration_mode = Some(DecorationMode::ServerSide);
+            state.decoration_mode = mode;
         });
         toplevel.send_configure();
-        log::info!("New decoration requested - using server-side");
+        log::info!("New decoration requested - using {:?}", mode);
     }
     fn request_mode(&mut self, toplevel: ToplevelSurface, mode: DecorationMode) {
-        let mode = if self.presentation.is_rootless() {
-            DecorationMode::ServerSide
-        } else {
-            mode
-        };
+        let mode = resolve_decoration_mode(self.presentation.is_rootless(), Some(mode));
         toplevel.with_pending_state(|state| {
-            state.decoration_mode = Some(mode);
+            state.decoration_mode = mode;
         });
         toplevel.send_configure();
         log::info!("Decoration mode requested: {:?}", mode);
     }
     fn unset_mode(&mut self, toplevel: ToplevelSurface) {
+        let mode = resolve_decoration_mode(self.presentation.is_rootless(), None);
         toplevel.with_pending_state(|state| {
-            state.decoration_mode = Some(DecorationMode::ServerSide);
+            state.decoration_mode = mode;
         });
         toplevel.send_configure();
-        log::info!("Decoration mode unset - defaulting to server-side");
+        log::info!("Decoration mode unset - using {:?}", mode);
     }
 }
 delegate_xdg_decoration!(AppState);
@@ -2030,4 +2061,55 @@ fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
     let width = u32::from_be_bytes(bytes[16..20].try_into().ok()?);
     let height = u32::from_be_bytes(bytes[20..24].try_into().ok()?);
     Some((width, height))
+}
+
+#[cfg(test)]
+mod decoration_tests {
+    use super::{DecorationMode, client_draws_own_decorations, resolve_decoration_mode};
+
+    #[test]
+    fn explicit_client_side_request_is_honoured_in_rootless_mode() {
+        assert_eq!(
+            resolve_decoration_mode(true, Some(DecorationMode::ClientSide)),
+            Some(DecorationMode::ClientSide)
+        );
+    }
+
+    #[test]
+    fn explicit_server_side_request_is_honoured() {
+        assert_eq!(
+            resolve_decoration_mode(true, Some(DecorationMode::ServerSide)),
+            Some(DecorationMode::ServerSide)
+        );
+    }
+
+    #[test]
+    fn unrequested_rootless_toplevel_advertises_server_side() {
+        assert_eq!(
+            resolve_decoration_mode(true, None),
+            Some(DecorationMode::ServerSide)
+        );
+    }
+
+    #[test]
+    fn unrequested_tiled_toplevel_stays_unset() {
+        assert_eq!(resolve_decoration_mode(false, None), None);
+    }
+
+    /// Regression test: Chromium and Electron negotiate `zxdg_decoration_manager_v1`,
+    /// ask for client-side decorations, ignore the server-side configure and keep
+    /// drawing their own window buttons. Hiding the native title bar for them is what
+    /// prevents a doubled title bar.
+    #[test]
+    fn client_side_clients_hide_the_native_title_bar() {
+        assert!(client_draws_own_decorations(Some(
+            DecorationMode::ClientSide
+        )));
+        // No negotiation at all (GTK4, Firefox) also means client-drawn chrome.
+        assert!(client_draws_own_decorations(None));
+        // Only a genuine server-side mode keeps the native title bar.
+        assert!(!client_draws_own_decorations(Some(
+            DecorationMode::ServerSide
+        )));
+    }
 }

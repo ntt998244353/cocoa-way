@@ -3441,10 +3441,20 @@ fn create_event_handler(
                     // Hide it but keep the window titled: a borderless NSWindow can't be resized
                     // from its edges. Move requests already start a native drag.
                     use winit::platform::macos::WindowAttributesExtMacOS;
-                    let client_side_decorations = !(toplevel.with_committed_state(|state| {
-                        state.is_some_and(|state| state.decoration_mode.is_some())
-                    }) || toplevel
-                        .with_pending_state(|state| state.decoration_mode.is_some()));
+                    // Server-side decoration mode means macOS supplies the title bar.
+                    // Anything else (no negotiation, or a client that explicitly asked
+                    // for client-side decorations) means the client draws its own
+                    // chrome, so the native title bar must be hidden to avoid a
+                    // doubled title bar.
+                    let decoration_mode = toplevel
+                        .with_pending_state(|state| state.decoration_mode)
+                        .or_else(|| {
+                            toplevel.with_committed_state(|state| {
+                                state.and_then(|state| state.decoration_mode)
+                            })
+                        });
+                    let client_side_decorations =
+                        crate::state::client_draws_own_decorations(decoration_mode);
                     let attributes = winit::window::Window::default_attributes()
                         .with_title(presentation::toplevel_title(&toplevel))
                         .with_titlebar_transparent(client_side_decorations)
